@@ -15,3 +15,5 @@ For the purposes of this script, quotas are assumed to be set on directories and
 Quotamonitor has been tested on RHEL/CentOS/Scientific Linux 7.x and assumes a Linux operating system, although hopefully I've coded it in a way that it could be modified fairly easily to support Windows. 
 
 Quotamonitor requires Python 2.7, as Qumulo does not yet support Python 3.x. 
+
+This project is licensed under the terms of the MIT license.
