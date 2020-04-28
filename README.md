@@ -1,4 +1,5 @@
-# quotamonitor
+# QUOTAMONITOR
+
 Quotamonitor is a script that is used to check quotas across multiple different storage systems, notify owners of , and write quota information to CSV files and a mysql database. At this time it supports the following storage system vendors: 
 * DellEMC Isilon
 * Qumulo
@@ -18,7 +19,8 @@ Quotamonitor requires Python 2.7, as Qumulo does not yet support Python 3.x.
 
 Please see the top of the script for the Python modules required. 
 
-# Configuration
+## Configuration
 Configuration is stored in a json file in the same directory as quotamonitor.py. An example configuration is provided, although it may not include all of the possible permutations of the configuration. 
 
+## License
 This project is licensed under the terms of the MIT license.
