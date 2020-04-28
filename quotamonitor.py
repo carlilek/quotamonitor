@@ -811,7 +811,7 @@ def connect_to_db():
 
 def main(argv):
     ### Edit the configpath for the location of your config.json ### 
-    configpath = "/misc/local/admin/universalquota/uconfig.json"
+    configpath = "./config.json"
     ################################################################
 
     parser = argparse.ArgumentParser('Check quota status, create log file, and email if over quota')
