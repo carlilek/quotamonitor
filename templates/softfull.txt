@@ -1,0 +1,9 @@
+The ${LABNAME} ${STORAGE} share (${NFSPATH}) has reached its quota. Please do not write any more data to this share until this issue has been resolved.<br> 
+Please let the Storage Team know if you need a quota increase or assistance with bulk archives or deletes by putting in a Helpdesk ticket or replying to this email.<br><br> 
+
+Usage: ${USAGE} TB <br>
+Quota: ${QUOTA} TB <br><br>
+
+
+Thanks, <br>
+Storage Admins
