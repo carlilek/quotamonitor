@@ -1,6 +1,6 @@
 # QUOTAMONITOR
 
-Quotamonitor is a script that is used to check quotas across multiple different storage systems, notify owners of , and write quota information to CSV files and a mysql database. At this time it supports the following storage system vendors: 
+Quotamonitor is a script that is used to check quotas across multiple different storage systems, notify owners of, and write quota information to CSV files and a mysql database. At this time it supports the following storage system vendors: 
 * DellEMC Isilon
 * Qumulo
 * Vast Data
