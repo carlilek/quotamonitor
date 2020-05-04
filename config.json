@@ -5,6 +5,10 @@
         "default_recipient":["storageadmins@example.com"],
         "default_alert_percent":98,
         "template_path":"/fully/qualified/path/templates"
+        "subject":{
+            "warn":"{} {} Quota Near Limit",
+            "full":"{} {} Quota Full"
+        }
     },
     "db_settings":{
         "user":"quotadbuser",
@@ -18,6 +22,24 @@
             "primary":"primary"
         }
     },
+    "application_shares":{
+        "appname1":{
+            "storageprefix":{
+                "fastscratch":"/path/to/application/storage"
+            },
+            "addmail":[
+                "appadmin1@example.com", 
+                "appadmin2@example.com"  
+            ],
+            "warn_percent":95,
+            "full_percent":98,      
+            "subject":{
+                "warn":"Application Storage Warning",
+                "full":"!!!Application Storage Alert!!!"
+            }
+        }
+    },
+
 	"storagesystems":{	
     	"nearline2":{
         	"url":"qk144-1.example.com",
@@ -57,18 +79,12 @@
 		}
 	},
 	"groups":{
-     	"application-smith":{
-           	"mail_to":[ 
-					"smithr@example.com", 
-					"storageadmins@example.com"  
-					],
-            "warn_percent":90
-        },
         "smith":{
             "mail_to":[ 
 				"smithr@example.com",
 				"storageadmins@example.com",
 				],
+			"application":["appname1"],
             "warn_percent":99
         },
         "labproject":{
