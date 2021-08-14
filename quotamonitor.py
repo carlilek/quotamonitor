@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 import os
 import sys 
 import json
@@ -9,15 +9,16 @@ import collections
 import csv
 import requests
 import urllib3
-import isi_sdk_8_1_0
+import isi_sdk_9_0_0 as isi_sdk
 from qumulo.rest_client import RestClient as qRestClient
 import six.moves.urllib as urllib
-from urllib import quote
+from urllib.parse import quote
 from datetime import timedelta
 from datetime import datetime
 from time import time
 from string import Template
-import MySQLdb as mdb
+import pymysql as mdb
+import logging
 
 urllib3.disable_warnings()
 
@@ -26,33 +27,6 @@ KILOBYTE = 1024
 MEGABYTE = 1024 * KILOBYTE
 GIGABYTE = 1024 * MEGABYTE
 TERABYTE = 1024 * GIGABYTE
-
-# Decode Functions
-def _decode_list(data):
-    rv = []
-    for item in data:
-        if isinstance(item, unicode):
-            item = item.encode('utf-8')
-        elif isinstance(item, list):
-            item = _decode_list(item)
-        elif isinstance(item, dict):
-            item = _decode_dict(item)
-        rv.append(item)
-    return rv
-
-def _decode_dict(data):
-    rv = {}
-    for key, value in data.iteritems():
-        if isinstance(key, unicode):
-            key = key.encode('utf-8')
-        if isinstance(value, unicode):
-            value = value.encode('utf-8')
-        elif isinstance(value, list):
-            value = _decode_list(value)
-        elif isinstance(value, dict):
-            value = _decode_dict(value)
-        rv[key] = value
-    return rv
 
 ### Storage Class Definitions ###
 
@@ -73,8 +47,8 @@ class q_api:
             self.rc = qRestClient(self.host, self.port)
             self.rc.login(self.user, self.password)
         except Exception as excpt:
-            print("Error connecting to the REST server: {}".format(excpt))
-            print(__doc__)
+            logging.warn(("Error connecting to the REST server: {}".format(excpt)))
+            #print(__doc__)
             pass
 
     def get_free_space(self):
@@ -85,9 +59,9 @@ class q_api:
     def get_all_quotas(self):
         try:
             all_quotas_raw = self.rc.quota.get_all_quotas_with_status(10000)
-            self.quotalist = _decode_list(list(all_quotas_raw)[0]['quotas'])
+            self.quotalist = list(all_quotas_raw)[0]['quotas']
         except Exception as excpt:
-            print("An error occurred contacting the storage for the quota list: {}".format(excpt))
+            logging.error(("An error occurred contacting the storage for the quota list: {}".format(excpt)))
             sys.exit(1)
     
     def get_total_files(self, toppath):
@@ -96,25 +70,24 @@ class q_api:
         total_files = int(fs_stats['total_files'])
         return total_files
     
-    def process_quotas(self):
+    def process_quotas(self, custom_mapping, groupdict):
         self.login()
         self.get_free_space()
         self.get_all_quotas()
         self.quotadict = {}
         for quota in self.quotalist:
-            lab, nfspath, application = translate_path(quota['path'], self.systemname, self.nfsmapping)
-            if nfspath is None:
-                continue
-            if application is not '':
-                lab = '{}--{}'.format(lab, application)
-            self.quotadict[lab]={
-                'usage':int(quota['capacity_usage']),
-                'quota':int(quota['limit']),
-                'total_files':self.get_total_files(quota['path']),
-                'total_files':0,
-                'nfspath':nfspath,
-                'special':application
-                }
+            lab, nfspath, application = translate_path(quota['path'], self.systemname, self.nfsmapping, custom_mapping, groupdict)
+            if nfspath:
+                if application != '':
+                    lab = '{}--{}'.format(lab, application)
+                self.quotadict[lab]={
+                    'usage':int(quota['capacity_usage']),
+                    'quota':int(quota['limit']),
+                    'total_files':self.get_total_files(quota['path']),
+                    'total_files':0,
+                    'nfspath':nfspath,
+                    'special':application
+                    }
         self.quotadict['FREE'] = {'freesize':self.freesize,'totalsize':self.totalsize}
 
             
@@ -132,29 +105,35 @@ class v_api:
         try:
             s = requests.session()
             data = s.get('https://{}/api/{}/'.format(self.host, vobj), auth=(self.user, self.password), verify=False)
-            return data.json()
+            datajson = data.json()
+            if 'detail' in list(datajson[0].keys()):
+                logging.error(('{} failed login: '.format(self.systemname)))
+                logging.error((datajson[0]['detail'].decode()))
+                sys.exit(1)
+            return datajson
         except Exception as excpt:
-            print("Error connecting to the REST server: {}".format(excpt))
-            print(__doc__)
+            logging.error(("Error connecting to the REST server: {}".format(excpt)))
+            #print(__doc__)
             sys.exit(1)
             
     def get_free_space(self):
-        inuse = int(self.get_data('clusters')[0]["logical_space_in_use"])
+        clusterdata = self.get_data('clusters')
+        inuse = int(clusterdata[0]["logical_space_in_use"])
         self.totalsize = int(self.get_data('clusters')[0]["logical_space"])
         self.freesize = self.totalsize - inuse
 
     def get_all_quotas(self):
-        self.quotalist = _decode_list(self.get_data('quotas'))
+        self.quotalist = self.get_data('quotas')
     
-    def process_quotas(self):
+    def process_quotas(self, custom_mapping, groupdict):
         self.get_free_space()
         self.get_all_quotas()
         self.quotadict = {}
         for quota in self.quotalist:
-            lab, nfspath, application = translate_path(quota['path'], self.systemname, self.nfsmapping)
+            lab, nfspath, application = translate_path(quota['path'], self.systemname, self.nfsmapping, custom_mapping, groupdict)
             if nfspath is None:
                 continue
-            if application is not '':
+            if application != '':
                 lab = '{}--{}'.format(lab, application)
             self.quotadict[lab]={
                 'usage':int(quota['used_capacity']),
@@ -174,18 +153,19 @@ class i_api:
         self.host = iconfig['url']
         self.logfile = iconfig['logfile']
         self.nfsmapping = iconfig['nfsmapping']
+        self.quotadict = {}
         
     def login(self):
         # configure cluster connection: basicAuth
-        configuration = isi_sdk_8_1_0.Configuration()
+        configuration = isi_sdk.Configuration()
         configuration.host = 'https://{}:8080'.format(self.host)
         configuration.username = self.user
         configuration.password = self.password
         configuration.verify_ssl = False
         # create an instance of the API class
-        api_client = isi_sdk_8_1_0.ApiClient(configuration)
-        self.cluster_api = isi_sdk_8_1_0.ClusterApi(api_client)
-        self.quota_api = isi_sdk_8_1_0.QuotaApi(api_client)
+        api_client = isi_sdk.ApiClient(configuration)
+        self.cluster_api = isi_sdk.ClusterApi(api_client)
+        self.quota_api = isi_sdk.QuotaApi(api_client)
         
     def get_free_space(self):
         clusterinfo = self.cluster_api.get_cluster_statfs()
@@ -194,26 +174,25 @@ class i_api:
     
     def get_all_quotas(self):
         self.quotalist = self.quota_api.list_quota_quotas().to_dict()['quotas']
-        
-    def process_quotas(self):
+
+    def process_quotas(self, custom_mapping, groupdict):
         self.login()
         self.get_free_space()
         self.get_all_quotas()
-        self.quotadict = {}
         for quota in self.quotalist:
             toppath = quota['path']
-            lab, nfspath, application = translate_path(toppath, self.systemname, self.nfsmapping)
-            if nfspath is None:
-              continue
-            if application is not '':
-                lab = '{}--{}'.format(lab, application)
-            self.quotadict[lab]={
-                'usage':int(quota['usage']['logical']),
-                'quota':int(quota['thresholds']['hard']),
-                'total_files':int(quota['usage']['inodes']),
-                'nfspath':nfspath,
-                'special':application
-                }
+            lab, nfspath, application = translate_path(toppath, self.systemname, self.nfsmapping, custom_mapping, groupdict)
+        #    print(lab, nfspath, application)
+            if nfspath is not None:
+                if application != '':
+                    lab = '{}--{}'.format(lab, application)
+                self.quotadict[lab]={
+                    'usage':int(quota['usage']['fslogical']),
+                    'quota':int(quota['thresholds']['hard']),
+                    'total_files':int(quota['usage']['inodes']),
+                    'nfspath':nfspath,
+                    'special':application
+                    }
         self.quotadict['FREE'] = {'freesize':self.freesize,'totalsize':self.totalsize}
 
 # Racktop
@@ -243,10 +222,10 @@ class r_api:
         urltoget = "https://{}:8443/internal/v1/zfs/datasets?dataset={}&types=all&props=refquota,usedbydataset&offset=1".format(self.host, self.dataset)
         response = requests.get(urltoget, headers=self.headers, verify=False)
         if response.status_code != 200:
-            print("invalid auth response")
-            print(response.request)
-            print(response.reason)
-        datasets_raw = _decode_dict(response.json())['Datasets']
+            logging.warn("invalid auth response")
+            logging.warn((response.request))
+            logging.warn((response.reason))
+        datasets_raw = response.json()['Datasets']
         for dataset in datasets_raw:
             self.quotalist.append({
                 'toppath':'/' + dataset['Path'],
@@ -259,22 +238,27 @@ class r_api:
         volume = self.dataset.split('/')[0]
         urltoget = "https://{}:8443/internal/v1/zfs/dataset?dataset={}".format(self.host, volume)
         response = requests.get(urltoget, headers=self.headers, verify=False)
-        free_raw = _decode_dict(response.json())['Dataset']
+        try:
+            free_raw = response.json()['Dataset']
+        except:
+            print(self.host, volume)
+            print(response.json())
+            return
         self.freesize = [property for property in free_raw['Properties'] if property['Name'] == 'available'][0]['Value']
         used = [property for property in free_raw['Properties'] if property['Name'] == 'used'][0]['Value']
         self.totalsize = int(self.freesize) + int(used)
       
                                     
-    def process_quotas(self):
+    def process_quotas(self, custom_mapping, groupdict):
         self.login()
         self.get_all_quotas()
-        self.get_free()
+        #self.get_free()
         self.quotadict = {}
         for quota in self.quotalist:
-            lab, nfspath, application = translate_path(quota['toppath'], self.systemname, self.nfsmapping)
+            lab, nfspath, application = translate_path(quota['toppath'], self.systemname, self.nfsmapping, custom_mapping, groupdict)
             if nfspath is None:
               continue
-            if application is not '':
+            if application != '':
                 lab = '{}--{}'.format(lab, application)
             self.quotadict[lab]={
                 'usage':int(quota['used']),
@@ -283,7 +267,7 @@ class r_api:
                 'nfspath':nfspath,
                 'special':application
                 }
-        self.quotadict['FREE'] = {'freesize':self.freesize,'totalsize':self.totalsize}
+        #self.quotadict['FREE'] = {'freesize':self.freesize,'totalsize':self.totalsize}
 
 #Nexenta 5
 
@@ -307,9 +291,9 @@ class n_api:
             verify=False
             )
         if response.status_code != 200:
-            print("invalid auth response")
-            print(response.request)
-            print(response.reason)
+            logging.warn("invalid auth response")
+            logging.warn((response.request))
+            logging.warn((response.reason))
         self.headers['Authorization'] = "Bearer {}".format(response.json()['token'])
     
     def get_all_quotas(self):
@@ -317,11 +301,15 @@ class n_api:
         urltoget = "https://{}:8443/storage/filesystems".format(self.host)
         response = requests.get(urltoget, headers=self.headers, verify=False)
         if response.status_code != 200:
-            print("invalid auth response")
-            print(response.request)
-            print(response.reason)
-        datasets_raw = _decode_dict(response.json())['data']
-        topinfo = datasets_raw.pop(0)
+            logging.warn("invalid api response")
+            logging.warn((response.request))
+            logging.warn((response.reason))
+        datasets_raw = response.json()['data']
+        try:
+            topinfo = datasets_raw.pop(0)
+        except:
+            logging.error(f'{self.host} does not have any filesystems')
+            return
         self.freesize = topinfo['bytesAvailable']
         used = topinfo['bytesUsed']
         self.totalsize = self.freesize + used
@@ -336,19 +324,19 @@ class n_api:
     def get_refquota(self, name):
         urltoget = "https://{}:8443/storage/filesystems/{}%2F{}".format(self.host, self.toplevel, name)
         response = requests.get(urltoget, headers=self.headers, verify=False)
-        rawdata = _decode_dict(response.json())
+        rawdata = response.json()
         refquota = rawdata['referencedQuotaSize']
         return refquota
       
-    def process_quotas(self):
+    def process_quotas(self, custom_mapping, groupdict):
         self.login()
         self.get_all_quotas()
         self.quotadict = {}
         for quota in self.quotalist:
-            lab, nfspath, application = translate_path(quota['toppath'], self.systemname, self.nfsmapping)
+            lab, nfspath, application = translate_path(quota['toppath'], self.systemname, self.nfsmapping, custom_mapping, groupdict)
             if nfspath is None:
               continue
-            if application is not '':
+            if application != '':
                 lab = '{}--{}'.format(lab, application)
             self.quotadict[lab]={
                 'usage':int(quota['used']),
@@ -366,6 +354,7 @@ class sf_api:
         self.password = sfconfig['password']
         self.host = sfconfig['url']
         self.logfile = sfconfig['logfile']
+        self.nfsmapping = sfconfig['nfsmapping']
         self.response = {}
         
     def login(self):
@@ -378,9 +367,9 @@ class sf_api:
             verify=False
             )
         if response.status_code != 200:
-            print("invalid auth response")
-            print(response.request)
-            print(response.reason)
+            logging.warn("invalid auth response")
+            logging.warn((response.request))
+            logging.warn((response.reason))
         else:
             token = response.json()['token']
             self.headers['Authorization'] = "Bearer {}".format(token)
@@ -393,26 +382,26 @@ class sf_api:
             verify=False
             ).json()
         if len(sf_response) == 1:
-            return _decode_dict(sf_response[0])
+            return sf_response[0]
         else:
-            print("Exception on vol_path, multiple items returned")
+            logging.warn("Exception on vol_path, multiple items returned")
     
     def get_all_quotas(self, volpathlimits):
         self.sfquotadict = {}
-        for vol_path,limit in volpathlimits.iteritems():
+        for vol_path,limit in volpathlimits.items():
             self.sfquotadict[vol_path] = {'sfdata':self.getquota(vol_path), 'limit':limit}
         
-    def process_quotas(self):
+    def process_quotas(self, custom_mapping, groupdict):
         self.softquotadict = {}
-        for volpath, sfquota in self.sfquotadict.iteritems():
+        for volpath, sfquota in self.sfquotadict.items():
             storage, path = volpath.split(':')
-            if storage not in self.softquotadict.keys():
+            if storage not in list(self.softquotadict.keys()):
                 self.softquotadict[storage] = {}
             rawpath = '/{}/{}'.format(storage,path)
-            lab, nfspath, application = translate_path(rawpath, storage, self.nfsmapping)
+            lab, nfspath, application = translate_path(rawpath, storage, self.nfsmapping, custom_mapping, groupdict)
             if nfspath is None:
                 continue
-            if application is not '':
+            if application != '':
                 lab = '{}--{}'.format(lab, application)
             self.softquotadict[storage][lab]={
                 'usage':int(sfquota['sfdata']['rec_aggrs']['size']),
@@ -431,8 +420,10 @@ class df_system:
         self.nfsmapping = dfconfig['nfsmapping']
     
     def get_mounts(self):
-        self.mounts = [line.split()[1] for line in open("/etc/mtab")
+        f = open('/etc/mtab', 'r')
+        self.mounts = [line.split()[1] for line in f
                       if line.split()[0].startswith(self.mountpath)]
+        f.close()
         
     def get_all_quotas(self):
         self.quotalist = []
@@ -441,16 +432,16 @@ class df_system:
             line = rawusage.readlines()[-1]
             self.quotalist.append(line.split())
             
-    def process_quotas(self):
+    def process_quotas(self, custom_mapping, groupdict):
         self.get_mounts()
         self.get_all_quotas()
         self.quotadict = {}
         for quota in self.quotalist:
             toppath = quota[5]
-            lab, nfspath, application = translate_path(toppath, self.systemname, self.nfsmapping)
+            lab, nfspath, application = translate_path(toppath, self.systemname, self.nfsmapping, custom_mapping, groupdict)
             if nfspath is None:
                 continue
-            if application is not '':
+            if application != '':
                 lab = '{}--{}'.format(lab, application)
             self.quotadict[lab]={
                 'usage':int(quota[2]) * KILOBYTE,
@@ -474,115 +465,124 @@ def getconfig(configpath):
     custom_mapping = {}
     try:
         with open (configpath, 'r') as j:
-            config = json.load(j, object_hook=_decode_dict)
+            config = json.load(j)
 
         for storagename in (
-                storagename for storagename in config['storagesystems'].keys() if 'qumulo' in config['storagesystems'][storagename]['type']
+                storagename for storagename in list(config['storagesystems'].keys()) if 'qumulo' in config['storagesystems'][storagename]['type']
             ):
             config['storagesystems'][storagename]['port'] = 8000
 
         group_dict = {}
-        for lab,lab_info in config['groups'].iteritems():
+        for lab,lab_info in config['groups'].items():
             group_dict[lab] = lab_info
-            if 'custom_mapping' in lab_info.keys():
-                for storagesystem,cmname in lab_info['custom_mapping'].iteritems():
-                    if cmname not in custom_mapping.keys():
+            if 'custom_mapping' in list(lab_info.keys()):
+                for storagesystem,cmname in lab_info['custom_mapping'].items():
+                    if cmname not in list(custom_mapping.keys()):
                         custom_mapping[cmname] = {}
                     custom_mapping[cmname][storagesystem] = lab
 
-    except Exception as excpt:
-        print("Improperly formatted {} or missing file: ".format(configpath))
-        print(excpt)
+    except Exception as ex:
+        logging.error(("Improperly formatted {} or missing file: ".format(configpath)))
+        logging.error(ex)
         sys.exit(1)
         
     return config, group_dict, custom_mapping
 
-def translate_path(toppath, systemname, nfsmapping):
+def translate_path(toppath, systemname, nfsmapping, custom_mapping, groupdict):
     lab = None
     nfspath = None
     application = ''
-    for mapping in (mapping for mapping in nfsmapping.keys() if mapping in toppath):
-        lab = os.path.relpath(toppath, mapping)
-        if lab is '.':
+    for mapping in (mapping for mapping in list(nfsmapping.keys()) if mapping in toppath):
+        labcandidate = os.path.relpath(toppath, mapping)
+        if labcandidate == '.':
             try:
                 quotaname = os.path.basename(os.path.normpath(toppath))
-                lab = groupdict[quotaname]['custom_name'][systemname]
+                labcandidate = groupdict[quotaname]['custom_name'][systemname]
             except:
-                print('Mapping not found for {}'.format(toppath))
+                logging.info(('Mapping not found for {}'.format(toppath)))
                 continue
+        if lab == None:
+            lab = labcandidate
+        elif len(labcandidate) < len(lab):
+            lab = labcandidate
         nfspath = os.path.join(nfsmapping[mapping], lab)
     
-    if lab in custom_mapping.keys() and systemname in custom_mapping[lab].keys():
+    if lab in list(custom_mapping.keys()) and systemname in list(custom_mapping[lab].keys()):
         lab = custom_mapping[lab][systemname]
 
-    if lab in groupdict.keys():
+    if lab in list(groupdict.keys()):
         labdict = groupdict[lab]
-        if 'custom_name' in labdict.keys() and systemname in labdict['custom_name'].keys():
+        if 'custom_name' in list(labdict.keys()) and systemname in list(labdict['custom_name'].keys()):
             nfspath = os.path.join(os.path.dirname(nfspath), labdict['custom_name'][systemname])
 
-    for app in configdict['application_shares'].keys():
+    for app in list(configdict['application_shares'].keys()):
         prefix = configdict['application_shares'][app]['storageprefix']
         if prefix.get(systemname, 'NONE') in toppath:
             application = app
     return lab, nfspath, application
 
 
-def buildsystemdict():
+def buildsystemdict(custom_mapping, groupdict):
     systemdict = {}
-    for systemname, config in configdict['storagesystems'].iteritems():
+    for systemname, config in configdict['storagesystems'].items():
         if 'vast' in config['type']:
             systemdict[systemname] = v_api(systemname, config)
-            systemdict[systemname].process_quotas()
         
         elif 'qumulo' in config['type']:
             systemdict[systemname] = q_api(systemname, config)
-            systemdict[systemname].process_quotas()
     
         elif 'isilon' in config['type']:
             systemdict[systemname] = i_api(systemname, config)
-            systemdict[systemname].process_quotas()
 
         elif 'racktop' in config['type']:
             systemdict[systemname] = r_api(systemname, config)
-            systemdict[systemname].process_quotas()
             
         elif 'nexenta' in config['type']:
             systemdict[systemname] = n_api(systemname, config)
-            systemdict[systemname].process_quotas()
 
         elif 'generic' in config['type']:
             systemdict[systemname] = df_system(systemname, config)
-            systemdict[systemname].process_quotas()
+            
+        try:
+            systemdict[systemname].process_quotas(custom_mapping, groupdict)
+            logging.info("Gathered quotas from {}".format(systemname))
+        except Exception as ex:
+            logging.error("Could not get quotas for {}: {}".format(systemname, ex))
+
+    try:        
+        systemdict = get_soft_quotas(systemdict, custom_mapping, groupdict)
+    except Exception as ex:
+        logging.warning("Could not get soft quotas: {}".format(ex))
         
-    get_soft_quotas()
 
     return systemdict
 
-def get_soft_quotas():
+def get_soft_quotas(systemdict, custom_mapping, groupdict):
     starfish = sf_api(configdict['storagesystems']['starfish'])
     starfish.login()
     volpathlimits = {}
-    for group in (group for group in groupdict.keys() if 'soft_quota' in groupdict[group].keys()):
-        for storage, limit in groupdict[group]['soft_quota'].iteritems():
+    for group in (group for group in list(groupdict.keys()) if 'soft_quota' in list(groupdict[group].keys())):
+        for storage, limit in groupdict[group]['soft_quota'].items():
             vol_path = "{}:{}".format(storage, group)
-            volpathlimits[vol_path] = limit
+            volpathlimits[vol_path] = int(limit)
     starfish.get_all_quotas(volpathlimits)
-    starfish.process_quotas()
-    for volume, entry in starfish.softquotadict.iteritems():
-        if volume not in systemdict.keys():
+    starfish.process_quotas(custom_mapping, groupdict)
+    for volume, entry in starfish.softquotadict.items():
+        if volume not in list(systemdict.keys()):
             systemdict[volume] = unlisted_storage(volume)
-        for lab, quota in entry.iteritems():
+        for lab, quota in entry.items():
             systemdict[volume].quotadict[lab] = quota
+    return systemdict
 
 ### LogFile Functions ###
 
 def buildloglist():
     loglist = {}
     
-    for system, obj in systemdict.iteritems():
+    for system, obj in systemdict.items():
         freelist = []
         loglist[system] = []
-        for lab, linfo in obj.quotadict.iteritems():
+        for lab, linfo in obj.quotadict.items():
             try:
                 if lab == 'FREE':
                     freelist = ['FREE', linfo['freesize'], linfo['totalsize']]
@@ -590,15 +590,15 @@ def buildloglist():
                 lab = lab.replace('--{}'.format(linfo['special']),'')
                 loglist[system].append([lab, linfo['usage'], linfo['quota'], linfo['total_files'], linfo['special']])
             except Exception as excpt:
-                print("Could not build list for {} on {}".format(lab, system))
-                print linfo
-                print excpt
+                logging.warn(("Could not build list for {} on {}".format(lab, system)))
+                logging.warn(linfo)
+                logging.warn(excpt)
         loglist[system].sort()
         loglist[system].insert(0,freelist)
     return loglist
 
 def writecsvs(loglist):
-    for system in loglist.keys():
+    for system in list(loglist.keys()):
         try:
             with open (systemdict[system].logfile,'w') as f:
                 header = 'Lab,SpaceUsed,TotalSpace,TotalFile'
@@ -606,20 +606,20 @@ def writecsvs(loglist):
                 csv_writer = csv.writer(f)
                 csv_writer.writerows(loglist[system])
         except Exception as excpt:
-            print("Unable to write log file for {}".format(system))
-            print excpt
+            logging.warn(("Unable to write log file for {}".format(system)))
+            logging.warn(excpt)
 
 ### Email Functions ###
 
-def process_emails(default_recipient, default_alert_percent):
+def process_emails(default_recipient, default_alert_percent, groupdict):
     maillist = []
-    for system, obj in systemdict.iteritems():
-        for lab, linfo in obj.quotadict.iteritems():
+    for system, obj in systemdict.items():
+        for lab, linfo in obj.quotadict.items():
             recipient = []
             recipient.extend(default_recipient)
             if 'FREE' in lab:
                 continue
-            elif linfo['special'] is not '':
+            elif linfo['special'] != '':
                 groupkey = lab.replace('--{}'.format(linfo['special']),'')
             else:
                 groupkey = lab
@@ -628,16 +628,16 @@ def process_emails(default_recipient, default_alert_percent):
                 recipient.extend(configdict['application_shares'][linfo['special']]['addmail'])
                 
             labdict = obj.quotadict[lab]
-            if groupkey in groupdict.keys():
+            if groupkey in list(groupdict.keys()):
                 labconfig = groupdict[groupkey]
-                emailtype, checkfile, percentage = check_percentage(system, lab, labdict, labconfig['warn_percent'], configdict['application_shares'])
+                emailtype, checkfile, percentage = check_percentage(system, lab, labdict, int(labconfig['warn_percent']), configdict['application_shares'])
                 recipient.extend(labconfig['mail_to'])
             elif labdict['quota'] != 0:
                 emailtype, checkfile, percentage = check_percentage(system, lab, labdict, default_alert_percent, configdict['application_shares'])
 
-            if emailtype is not '':
+            if emailtype != '':
                 if not os.path.isfile(checkfile):
-                    with open(checkfile,"a+") as f:
+                    with open(checkfile, "a+") as f:
                         pass
                     maillist.append({
                         'nfspath':labdict['nfspath'], 
@@ -647,7 +647,7 @@ def process_emails(default_recipient, default_alert_percent):
                         'quota':'{:.2f}'.format(float(labdict['quota']) / TERABYTE), 
                         'mailto':recipient,
                         'mailtype':emailtype,
-                        'percentage':percentage,
+                        'percentage':'{:.2f}'.format(percentage),
                         'special':labdict['special']
                         })
 
@@ -664,9 +664,9 @@ def check_percentage(system, lab, labdict, warn_percent, application_shares):
     cleanupfiles(fullcheckfile, 1)
     cleanupfiles(warncheckfile, 7)
 
-    if labdict['special'] in application_shares.keys():
-        warn_percent = application_shares[labdict['special']]['warn_percent']
-        full_percent = application_shares[labdict['special']]['full_percent']
+    if labdict['special'] in list(application_shares.keys()):
+        warn_percent = int(application_shares[labdict['special']]['warn_percent'])
+        full_percent = int(application_shares[labdict['special']]['full_percent'])
     else:
         full_percent = 100
 
@@ -707,6 +707,7 @@ def buildmail(maildict, template_path, default_subject):
     mailtype = maildict['mailtype']
     special = maildict['special']
     labname = maildict['quotaname'].split('-')[0].capitalize()
+    logging.info(f'Notifying on {maildict["nfspath"]}')
 
     template = '{}{}.txt'.format(special, mailtype)
 
@@ -737,12 +738,12 @@ def send_mail(email_settings, subject, body, recipients):
         session = smtplib.SMTP(email_settings['smtp_server'])
         session.sendmail(email_settings['sender_address'], recipients, mmsg.as_string())
         session.quit()
-    except Exception,excpt:
-        print('Exception in sending mail to {}'.format(recipients))
-        print(excpt)
+    except Exception as excpt:
+        logging.warn(('Exception in sending mail to {}'.format(recipients)))
+        logging.warn(excpt)
 
-def sendalerts(email_settings):
-    maillist = process_emails(email_settings['default_recipient'], email_settings['default_alert_percent'])
+def sendalerts(email_settings, groupdict):
+    maillist = process_emails(email_settings['default_recipient'], email_settings['default_alert_percent'], groupdict)
     for maildict in maillist:
         subject, body = buildmail(maildict, email_settings['template_path'], email_settings['subject'])
         send_mail(email_settings, subject, body, maildict['mailto'])
@@ -759,11 +760,11 @@ def createinsertion(loglist, dbmap):
     holdingdict = {}
     #insertiondict = {}
     currdate = datetime.fromtimestamp(time())
-    for system in loglist.keys():
+    for system in list(loglist.keys()):
         tier = dbmap[system]
-        if tier not in holdingdict.keys():
+        if tier not in list(holdingdict.keys()):
             holdingdict[tier] = {}
-        for lab in (lab for lab in loglist[system] if len(lab) is not 0 and 'FREE' not in lab[0]):
+        for lab in (lab for lab in loglist[system] if len(lab) != 0 and 'FREE' not in lab[0]):
             if lab[4] not in ('', 'soft'):
                 labname = '{}-{}'.format(lab[0], lab[4])
             else:
@@ -773,62 +774,88 @@ def createinsertion(loglist, dbmap):
 
             try:
                 mapid = getinfofromdb(qdb, 'SELECT Id FROM Maps WHERE Name="{}"'.format(lab[0]))[0][0]
-            except Exception, excpt:
-                print('mapping not found: {} {}'.format(labname, excpt))
+            except Exception as excpt:
+                logging.info(('mapping not found: {} {}'.format(labname, excpt)))
                 continue
-            if getinfofromdb(qdb, 'SELECT * FROM {} where Path = "{}" AND Date = "{}"'.format(tier, 
-                            labname, currdate.date())) is ():
-                if labname not in holdingdict[tier].keys():
+            dbentry = getinfofromdb(qdb, 'SELECT * FROM {} where Path = "{}" AND Date = "{}"'.format(tier, labname, currdate.date()))
+            if len(list(dbentry)) == 0:
+                if labname not in list(holdingdict[tier].keys()):
                     holdingdict[tier][labname] = {'date':currdate.date(), 'used':used, 'quota':quota, 'mapping':mapid}
                 else:
                     totquot = holdingdict[tier][labname]['quota'] + quota
                     totused = holdingdict[tier][labname]['used'] + used
                     holdingdict[tier][labname]['quota'] = totquot
                     holdingdict[tier][labname]['used'] = totused
-    #    for line in holdingdict[tier]:
-    #        print(line, holdingdict[tier][line])
+            else:
+                continue
     insertintotable(holdingdict, qdb, dbcon)
 
 def insertintotable(holdingdict, qdb, dbcon):
-    for tier in (tier for tier in holdingdict.keys() if holdingdict[tier]):
+    for tier in (tier for tier in list(holdingdict.keys()) if holdingdict[tier]):
         insertionlist = []
-        for lab, insdict in holdingdict[tier].iteritems():
+        for lab, insdict in holdingdict[tier].items():
             insertionlist.append((insdict['date'], lab, insdict['used'], insdict['quota'], insdict['mapping']))
         sql = "INSERT INTO {} (Date, Path, Used, Hard, Map) VALUES (%s, %s, %s, %s, %s)".format(tier)
         qdb.executemany(sql, insertionlist)
     dbcon.commit()
+    qdb.close()
+    dbcon.close()
 
 def connect_to_db():
-    dbcon = mdb.connect(
-                        configdict['db_settings']['host'],
-                        configdict['db_settings']['user'], 
-                        configdict['db_settings']['password'],
-                        configdict['db_settings']['database']
+    try:
+        dbcon = mdb.connect(
+                        host=configdict['db_settings']['host'],
+                        user=configdict['db_settings']['user'], 
+                        password=configdict['db_settings']['password'],
+                        database=configdict['db_settings']['database'],
                        )
+    except mdb.Error as ex:
+        logging.error(f'Unable to connect to database: {ex}')
+        sys.exit(1)
     return dbcon, dbcon.cursor()
 
 ### Main ###
 
-def main(argv):
+if __name__ == '__main__':
+    argv = sys.argv[1:]
+
     ### Edit the configpath for the location of your config.json ### 
-    configpath = "./config.json"
+    configpath = "./uconfig.json"
     ################################################################
 
     parser = argparse.ArgumentParser('Check quota status, create log file, and email if over quota')
-    parser.add_argument('-c', '--config', type=str, default=configpath, required=False)
+    parser.add_argument('-c', '--config', type=str, default=configpath, required=False, help='Path to config file, defaults to ./uconfig.json')
+    parser.add_argument('-l', '--loglevel', type=str, default='warn', help='Level of logging: debug, info, error, warn, default to warn')
+    parser.add_argument('--logpath', type=str, default='/var/log/uquota.log', help='path to syslog file, default: /var/log/uquotas.log')
     args = parser.parse_args()
     configpath = args.config
 
-    global groupdict
+    logopts = {}
+    logopts['format'] = '%(asctime)s %(levelname)s: %(message)s'
+    logopts['filename'] = args.logpath 
+    if args.loglevel == 'debug':
+        logopts['level'] = logging.DEBUG
+    elif args.loglevel == 'info':
+        logopts['level'] = logging.INFO
+    elif args.loglevel == 'warn':
+        logopts['level'] = logging.WARN
+    elif args.loglevel == 'error':
+        logopts['level'] = logging.ERROR
+
+    logging.basicConfig(**logopts)
+
     global configdict
     global systemdict
-    global custom_mapping
+    logging.info('Starting quota gather')
+    #now = datetime.now()
+    #print (now.strftime("%Y-%m-%d %H:%M:%S"))
     configdict, groupdict, custom_mapping = getconfig(configpath)
-    systemdict = buildsystemdict()
+    systemdict = buildsystemdict(custom_mapping, groupdict)
     loglist = buildloglist()
+    logging.info('Writing csvs')
     writecsvs(loglist)
-    sendalerts(configdict['email_settings'])
+    logging.info('Sending alerts')
+    sendalerts(configdict['email_settings'], groupdict)
+    logging.info('Inserting into db')
     createinsertion(loglist, configdict['db_settings']['map'])
-
-if __name__ == '__main__':
-	main(sys.argv[1:])
+    logging.info('Done')
